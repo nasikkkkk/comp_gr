@@ -1,0 +1,252 @@
+import numpy as np
+import math
+import random
+from PIL import Image, ImageOps
+
+# Размеры выходного изображения
+w = 1000
+h = 1000
+# Z-буфер для хранения глубины пикселей
+Z_BUFFER = np.zeros((w, h), dtype=np.float32)
+Z_BUFFER[...] = np.inf  # Инициализируем бесконечными значениями
+
+def f0_fromFile(path:str):
+    """Извлекает индексы вершин для каждого полигона из OBJ файла"""
+    List = []
+    with open(path, 'r', encoding='utf-8') as file:
+        for line in file:
+            if line[0] == 'f' and line[1] == ' ':
+                line = line[2:-1]
+                List.append(list(map(int, [line.split(' ')[0].split('/')[0], line.split(' ')[1].split('/')[0], line.split(' ')[2].split('/')[0]])))
+    return List
+
+def f1_fromFile(path:str):
+    """Извлекает индексы текстурных координат для каждого полигона из OBJ файла"""
+    List = []
+    with open(path, 'r', encoding='utf-8') as file:
+        for line in file:
+            if line[0] == 'f' and line[1] == ' ':
+                line = line[2:-1]
+                List.append(list(map(int, [line.split(' ')[0].split('/')[1], line.split(' ')[1].split('/')[1], line.split(' ')[2].split('/')[1]])))
+    return List
+
+def v_fromFile(path:str):
+    """Загружает координаты вершин из OBJ файла"""
+    List = []
+    with open(path, 'r', encoding='utf-8') as file:
+        for line in file:
+            if line[0] == 'v' and line[1] == ' ':
+                line = line[2:-1]
+                List.append(list(map(float, line.split(' '))))
+    return List
+
+def vt_fromFile(path:str):
+    """Загружает текстурные координаты из OBJ файла"""
+    List = []
+    with open(path, 'r', encoding='utf-8') as file:
+        for line in file:
+            if line[0] == 'v' and line[1] == 't':
+                line = line[3:-1]
+                List.append(list(map(float, line.split(' '))))
+    return List
+
+def vn_fromFile(path:str):
+    """Загружает нормали вершин из OBJ файла"""
+    List = []
+    with open(path, 'r', encoding='utf-8') as file:
+        for line in file:
+            if line[0] == 'v' and line[1] == 'n':
+                line = line[3:-1]
+                List.append(list(map(float, line.split(' '))))
+    return List
+
+def bar_coord(x, y, x0, y0, x1, y1, x2, y2)->tuple:
+    """Вычисляет барицентрические координаты точки (x,y) относительно треугольника"""
+    lambda0 = ((x - x2) * (y1 - y2) - (x1 - x2) * (y - y2)) / ((x0 - x2) * (y1 - y2) - (x1 - x2) * (y0 - y2)) 
+    lambda1 = ((x0 - x2) * (y - y2) - (x - x2) * (y0 - y2)) /  ((x0 - x2) * (y1 - y2) - (x1 - x2) * (y0 - y2))
+    lambda2 = 1.0 - lambda0 - lambda1 
+    return (lambda0, lambda1, lambda2)
+
+def draw_triangle(
+    mat: np.ndarray,
+    x0: float, y0: float, z0: float,
+    x1: float, y1: float, z1: float,
+    x2: float, y2: float, z2: float,
+    color: tuple,
+    texture_coords: tuple,
+    image_text: np.ndarray
+) -> None:
+    """Отрисовывает текстурированный треугольник с использованием z-буфера"""
+    # Параметры проекции
+    SCALE = 400  # Масштаб проекции
+    OFFSET = 500  # Сдвиг по экрану
+    
+    
+    def project(x: float, y: float, z: float) -> tuple:
+        """Проецирует 3D точку на 2D экран"""
+        return SCALE * x / z + OFFSET, SCALE * y / z + OFFSET
+    
+    # Проецируем вершины треугольника
+    proj0 = project(x0, y0, z0)
+    proj1 = project(x1, y1, z1)
+    proj2 = project(x2, y2, z2)
+    
+    # Вычисляем ограничивающий прямоугольник с проверкой границ
+    x_coords = [proj0[0], proj1[0], proj2[0]]
+    y_coords = [proj0[1], proj1[1], proj2[1]]
+    
+    x_min = max(0, math.floor(min(x_coords)))
+    y_min = max(0, math.floor(min(y_coords)))
+    x_max = min(w, math.ceil(max(x_coords)))
+    y_max = min(h, math.ceil(max(y_coords)))
+    
+    # Обрабатываем каждый пиксель в ограничивающем прямоугольнике
+    for y in range(y_min, y_max):
+        for x in range(x_min, x_max):
+            # Получаем барицентрические координаты
+            lambdas = bar_coord(x, y, *proj0, *proj1, *proj2)
+            
+            # Проверяем, находится ли точка внутри треугольника
+            if all(l >= 0 for l in lambdas):
+                # Интерполируем глубину
+                depth = sum(l * z for l, z in zip(lambdas, [z0, z1, z2]))
+                
+                # Проверка z-буфера
+                if depth < Z_BUFFER[y, x]:
+                    Z_BUFFER[y, x] = depth
+                    
+                    # Текстурные координаты вершин
+                    tex_coords = [
+                        texture_coords[0], texture_coords[1],  # u0, v0
+                        texture_coords[2], texture_coords[3],  # u1, v1
+                        texture_coords[4], texture_coords[5]   # u2, v2
+                    ]
+                    
+                    # Интерполируем текстурные координаты
+                    u = sum(l * tc for l, tc in zip(lambdas, tex_coords[::2]))
+                    v = sum(l * tc for l, tc in zip(lambdas, tex_coords[1::2]))
+                    
+                    # Вычисляем координаты текстуры с проверкой границ
+                    tex_x = min(max(0, round(u * h)), h - 1)
+                    tex_y = min(max(0, round(v * w)), w - 1)
+                    
+                    # Устанавливаем цвет пикселя из текстуры
+                    mat[y, x] = image_text[tex_y][tex_x]
+
+def normal(x0, y0, z0, x1, y1, z1, x2, y2, z2):
+    """Вычисляет нормаль к треугольнику"""
+    n = np.cross(np.array([x1 - x2, y1 - y2, z1 - z2]), np.array([x1 - x0, y1 - y0, z1 - z0]))
+    return n/np.linalg.norm(n)
+
+def cosa(n:np.array):
+    """Вычисляет косинус угла между нормалью и направлением света (по оси Z)"""
+    l = np.array([0,0,1])
+    cosa = np.dot(n, l)/ (math.sqrt(n[0]**2 + n[1]**2 + n[2]**2))
+    return cosa
+
+def rotate_by_alplha_b_g(v, a, b, g):
+    """Применяет вращение и сдвиг к вершинам модели"""
+    # Создаем матрицы вращения
+    R = np.dot(np.array([[1, 0, 0], [0, math.cos(a), math.sin(a)], [0, -math.sin(a), math.cos(a)]]), 
+               np.array([[math.cos(b), 0, math.sin(b)], [0,1,0], [-math.sin(b), 0, math.cos(b)]]))
+    R = np.dot(R, np.array([[math.cos(g), math.sin(g), 0], [-math.sin(g), math.cos(g), 0], [0, 0, 1]]))
+    
+    # Параметры сдвига
+    tx = 0
+    ty = 0.03
+    tz = 0.1
+    
+    # Применяем преобразования ко всем вершинам
+    for i in range(len(v)):
+        v[i] = np.dot(R, np.array(v[i])) + np.array([tx, ty, tz])
+
+def create_image(
+    H: int,
+    W: int,
+    filename: str,
+    vertices: list,
+    face_vertex_indices: list,
+    face_texture_indices: list,
+    vertex_normals: list,
+    texture_coords: list,
+    texture_image: np.ndarray
+) -> None:
+    """Создает и сохраняет изображение с 3D моделью"""
+    # Инициализируем изображение белым фоном
+    image_array = np.full((H, W, 3), 255, dtype=np.uint8)
+    
+    # Вращаем вершины модели
+    ROTATION_ANGLES = (math.radians(160), -0.5, 0)
+    TRANSLATION = (0, 0.03, 0.1)
+    rotate_by_alplha_b_g(vertices, *ROTATION_ANGLES)
+    
+    # Вычисляем нормали вершин путем усреднения нормалей смежных граней
+    vn_calc = np.zeros((len(vertices), 3), dtype=np.float32)
+    
+    for face in face_vertex_indices:
+        # Получаем вершины текущей грани
+        v0_idx, v1_idx, v2_idx = [i-1 for i in face]
+        v0 = vertices[v0_idx]
+        v1 = vertices[v1_idx]
+        v2 = vertices[v2_idx]
+        
+        # Вычисляем нормаль грани и добавляем к нормалям вершин
+        face_normal = normal(*v0, *v1, *v2)
+        vn_calc[v0_idx] += face_normal
+        vn_calc[v1_idx] += face_normal
+        vn_calc[v2_idx] += face_normal
+    
+    # Нормализуем нормали вершин и вычисляем коэффициенты освещения
+    lighting_coeffs = []
+    for normal_vec in vn_calc:
+        normalized = normal_vec / np.linalg.norm(normal_vec)
+        lighting_coeffs.append(cosa(normalized))
+    
+    # Отрисовываем каждую грань
+    for face_v, face_t in zip(face_vertex_indices, face_texture_indices):
+        # Получаем данные вершин для текущей грани
+        v0_idx, v1_idx, v2_idx = [i-1 for i in face_v]
+        t0_idx, t1_idx, t2_idx = [i-1 for i in face_t]
+        
+        # Позиции вершин
+        x0, y0, z0 = vertices[v0_idx]
+        x1, y1, z1 = vertices[v1_idx]
+        x2, y2, z2 = vertices[v2_idx]
+        
+        # Текстурные координаты
+        u0, v0 = texture_coords[t0_idx]
+        u1, v1 = texture_coords[t1_idx]
+        u2, v2 = texture_coords[t2_idx]
+        
+        # Коэффициенты освещения
+        cosA = lighting_coeffs[v0_idx]
+        cosB = lighting_coeffs[v1_idx]
+        cosC = lighting_coeffs[v2_idx]
+        
+        # Отрисовываем треугольник
+        draw_triangle(
+            image_array,
+            x0, y0, z0,
+            x1, y1, z1,
+            x2, y2, z2,
+            (cosA, cosB, cosC),
+            (u0, v0, u1, v1, u2, v2),
+            texture_image
+        )
+    
+    # Сохраняем итоговое изображение
+    Image.fromarray(image_array, mode="RGB").save(filename)
+
+
+# Загружаем данные модели
+f0 = f0_fromFile("model_1.obj")  # Индексы вершин полигонов
+v = v_fromFile("model_1.obj")    # Координаты вершин
+vt = vt_fromFile("model_1.obj")  # Текстурные координаты
+vn = vn_fromFile("model_1.obj")  # Нормали вершин
+f1 = f1_fromFile("model_1.obj")  # Индексы текстурных координат
+
+# Загружаем и переворачиваем текстуру
+texture_image = np.array(ImageOps.flip(Image.open("bunny-atlas.jpg")))
+
+# Создаем итоговое изображение
+create_image(w, h, 'image_z_buffer.png', v, f0, f1, vn, vt, texture_image)
